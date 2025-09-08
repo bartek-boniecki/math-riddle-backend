@@ -2,14 +2,20 @@
 import json
 import random
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
-from .schemas import Challenge, GenerateRequest
+from .schemas import (
+    Challenge,
+    GenerateRequest,
+    # NEW: import helpers to show Polish labels in prompts and responses
+    polish_branch_label,
+    polish_level_label,
+    polish_scenario_label,
+)
+
 from .llm import chat
 
-# ====== ZBIORY TYPÓW ZADAŃ (charakterystyczne dla gałęzi) ======
-# UWAGA: zestawy są szerokie; generator losuje typy i narzędzia zgodnie z ograniczeniami.
-
+# ====== ZBIORY TYPÓW ZADAŃ (charakterystyczne dla gałęzi – kanoniczne klucze EN) ======
 BRANCH_TO_TYPES: Dict[str, List[str]] = {
     "Numbers and operations": [
         "sprytne łamanie nawiasów i porządek działań",
@@ -103,9 +109,10 @@ BRANCH_TO_TYPES: Dict[str, List[str]] = {
         "skoki Vieety (Vieta jumping) w tle diofantycznym",
         "kwadratowa optymalizacja z ograniczeniami",
     ],
-    "Sequences": [
+    "Sequences and series": [
         "rekurencje nieliniowe z inwariantem",
-        "telekopowanie sum",
+        "granice ciągów",
+        "szeregi geometryczne i arytmetyczne: zbieżność i suma",
         "ciągi definiowane przez warunek cyfr",
         "monotoniczność i ograniczoność z dowodem",
     ],
@@ -123,7 +130,7 @@ BRANCH_TO_TYPES: Dict[str, List[str]] = {
     ],
 }
 
-# Typowe narzędzia/techniki – dobierane losowo do typu/gałęzi
+# Narzędzia
 TOOLS_POOL = [
     "Zasada szufladkowa",
     "Inwariant/monowariant",
@@ -144,26 +151,27 @@ TOOLS_POOL = [
     "Normalizacja i skalowanie",
 ]
 
-# Wytyczne zależne od poziomu szkoły (po polsku)
 def level_guidelines(level: str) -> str:
+    # 'level' jest w kanonie EN; komunikat po polsku
     if level == "lower elementary school (grades 1-5)":
         return (
-            "Poziom: klasy 1–5. Zadanie ma być olimpijskie dla tego etapu: bez zaawansowanego rachunku, "
-            "może używać sprytu, parzystości, prostych niezmienników, rysunków/siatek, małą liczbę przypadków. "
+            "Poziom: klasy 1–5 szkoły podstawowej. Zadanie olimpijskie dla tego etapu: bez zaawansowanego rachunku, "
+            "może używać sprytu, parzystości, prostych niezmienników, rysunków/siatek, małej liczby przypadków. "
             "Unikaj rachunku różniczkowego, logarytmów i złożonych równań; dopuszczalne są proste równania/liczenie."
         )
     if level == "higher elementary school / middle school (grades 6-8)":
         return (
-            "Poziom: klasy 6–8. Zadanie ambitne, możliwe narzędzia: nierówności elementarne, konstrukcje geometryczne, "
+            "Poziom: klasy 6–8 szkoły podstawowej. Zadanie ambitne, możliwe narzędzia: nierówności elementarne, konstrukcje geometryczne, "
             "zasada szufladkowa, proste rekurencje, ułamki łańcuchowe intuicyjnie. Bez rachunku różniczkowego."
         )
     return (
-        "Poziom: szkoła średnia (9–12). Zadanie olimpijskie, może wymagać kombinatoryki na poziomie olimpiady, "
+        "Poziom: szkoła średnia (klasy 9–12). Zadanie olimpijskie, może wymagać kombinatoryki, "
         "nietrywialnych przekształceń algebraicznych, tożsamości trygonometrycznych, sprytnych układów równań, "
         "analizy funkcji bez formalnego całkowania."
     )
 
 def scenario_hint(s: str) -> str:
+    # 's' to kanon EN – mapy podpowiedzi zostają po EN
     hints = {
         "engineering": "Osadź historię w realiach inżynierskich (projekt, ograniczenia materiałowe, parametry).",
         "transport": "Użyj motywu rozkładów jazdy, prędkości, opóźnień, grafów połączeń.",
@@ -182,7 +190,7 @@ def pick_types_for_batch(branch: str, n: int = 5, rng: random.Random | None = No
     counts: Dict[str, int] = {}
     while len(chosen) < n:
         t = rng.choice(pool)
-        if counts.get(t, 0) < 2:  # najwyżej 2 wystąpienia jednego typu
+        if counts.get(t, 0) < 2:
             chosen.append(t)
             counts[t] = counts.get(t, 0) + 1
     return chosen
@@ -191,34 +199,29 @@ def pick_tool(rng: random.Random | None = None) -> str:
     rng = rng or random
     return rng.choice(TOOLS_POOL)
 
-
 def _json_from_text(txt: str) -> Dict:
     """
     Solidne wyciąganie JSON:
-    1) Spróbuj bezpośrednio json.loads.
-    2) Spróbuj z bloku ```json ... ```.
-    3) Ostatnia próba: dopasuj pierwszy poprawnie zbalansowany blok {...} licząc nawiasy,
-       z uwzględnieniem cudzysłowów i escapów.
+    1) json.loads bezpośrednio,
+    2) blok ```json ... ```,
+    3) zbalansowane nawiasy { } z obsługą cudzysłowów/escape.
     """
-    import json
-    import re
+    import json as _json
+    import re as _re
 
-    # 1) prosto
     try:
-        return json.loads(txt)
+        return _json.loads(txt)
     except Exception:
         pass
 
-    # 2) code fence
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", txt, flags=re.DOTALL | re.IGNORECASE)
+    m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", txt, flags=_re.DOTALL | _re.IGNORECASE)
     if m:
         cand = m.group(1)
         try:
-            return json.loads(cand)
+            return _json.loads(cand)
         except Exception:
             pass
 
-    # 3) zbalansowane nawiasy
     s = txt
     start = s.find("{")
     while start != -1:
@@ -244,33 +247,38 @@ def _json_from_text(txt: str) -> Dict:
                     if depth == 0:
                         cand = s[start : j + 1]
                         try:
-                            return json.loads(cand)
+                            return _json.loads(cand)
                         except Exception:
                             break
         start = s.find("{", start + 1)
     raise ValueError("Brak poprawnego JSON w odpowiedzi LLM.")
 
-
 def generate_single(
     idx: int,
-    branch: str,
-    level: str,
-    scenario: str,
+    branch: str,       # kanoniczny EN po walidacji
+    level: str,        # kanoniczny EN
+    scenario: str,     # kanoniczny EN
     challenge_type: str,
     tool: str,
     rng: random.Random,
 ) -> Challenge:
+    # NOWE: używamy polskich etykiet w samym promptcie i w wyjściu
+    pl_branch = polish_branch_label(branch)
+    pl_level = polish_level_label(level)
+    pl_scenario = polish_scenario_label(scenario)
+
     seed_tag = rng.randint(1, 10**9)
+
     sys = (
         "Jesteś twórcą olimpijskich zadań matematycznych. Odpowiadaj wyłącznie po polsku. "
         "Zachowuj ścisłość, zwięzłość i brak zbędnej narracji poza treścią zadania."
     )
     user = f"""
 Twoje zadanie:
-1) Wygeneruj JEDNO wymagające zadanie olimpijskie w gałęzi: "{branch}".
+1) Wygeneruj JEDNO wymagające zadanie olimpijskie w gałęzi: "{pl_branch}".
 2) Typ wyzwania (koniecznie użyj): "{challenge_type}".
 3) Narzędzie/technika, która ma być przydatna/przewodnia: "{tool}".
-4) Kontekst/scenariusz: "{scenario}". {scenario_hint(scenario)}
+4) Kontekst/scenariusz: "{pl_scenario}". {scenario_hint(scenario)}
 5) {level_guidelines(level)}
 6) Sformułuj treść jako realistyczną historię, ale bez zbędnych opisów. 
 7) Zapewnij jednoznaczność i możliwość pełnego rozwiązania.
@@ -290,16 +298,14 @@ Zwróć ściśle JSON w formacie:
         response_format="json_object",
     )
     js = _json_from_text(content)
-    # Druga faza: niezależny weryfikator/agent
-    verifier_sys = (
-        "Jesteś rygorystycznym weryfikatorem zadań. Sprawdzasz jednoznaczność, brak sprzeczności i poziom trudności."
-    )
+
+    verifier_sys = "Jesteś rygorystycznym weryfikatorem zadań. Sprawdzasz jednoznaczność, brak sprzeczności i poziom trudności."
     verifier_user = f"""
 Sprawdź zadanie pod kątem:
 - jednoznaczności (czy dane są wystarczające, czy wynik jest unikalny),
-- zgodności z gałęzią "{branch}",
-- dopasowania do poziomu "{level}",
-- ścisłego wplecenia scenariusza "{scenario}",
+- zgodności z gałęzią "{pl_branch}",
+- dopasowania do poziomu "{pl_level}",
+- ścisłego wplecenia scenariusza "{pl_scenario}",
 - użyteczności narzędzia "{tool}".
 
 Jeśli trzeba, zaproponuj minimalne poprawki treści (bez zmiany istoty), aby usunąć niejednoznaczność.
@@ -318,7 +324,7 @@ Zadanie do sprawdzenia:
         response_format="json_object",
     )
     vjs = _json_from_text(vresp)
-    # Jeśli niejednoznaczne, weź poprawioną treść i poproś o szkic na nowo (zachowując ten sam typ)
+
     if not vjs.get("unambiguous", False):
         fixer_sys = "Jesteś autorem zadań. Odpowiadaj po polsku i trzymaj się podanej treści."
         fixer_user = f"""
@@ -342,36 +348,33 @@ Poprawiona treść:
     else:
         verification_note = "(Weryfikator: zadanie jednoznaczne.)"
 
+    # NOWE: zapisujemy POLSKIE etykiety w odpowiedzi
     return Challenge(
         id=idx,
-        branch=branch,
-        school_level=level,
-        scenario=scenario,
+        branch=pl_branch,
+        school_level=pl_level,
+        scenario=pl_scenario,
         challenge_type=challenge_type,
         tool=tool,
         problem=js["problem"].strip(),
         solution_outline=js["solution_outline"].strip(),
-        verification=(js.get("sanity_check","").strip() + " " + verification_note).strip(),
+        verification=(js.get("sanity_check", "").strip() + " " + verification_note).strip(),
     )
 
 def generate_batch(req: GenerateRequest) -> List[Challenge]:
     rng = random.Random(req.seed) if req.seed is not None else random.Random()
     types = pick_types_for_batch(req.branch, 5, rng)
-    # Każde zadanie otrzymuje (być może różne) narzędzie
     challenges: List[Challenge] = []
     for i, t in enumerate(types, start=1):
         tool = pick_tool(rng)
         ch = generate_single(
             idx=i,
-            branch=req.branch,
-            level=req.school_level,
-            scenario=req.scenario,
+            branch=req.branch,           # kanon EN
+            level=req.school_level,      # kanon EN
+            scenario=req.scenario,       # kanon EN
             challenge_type=t,
             tool=tool,
             rng=rng,
         )
         challenges.append(ch)
-    # Ostateczna kontrola: w każdym zbiorze jest dokładnie 5, typy z ograniczeniem <=2 spełnione,
-    # wszystkie po polsku (heurystyka: obecność polskich znaków nie jest wymagana – dopuszczamy poprawną polszczyznę bez diakrytyków)
-    # Dodatkowe sprawdzenia mogłyby być tu dodane.
     return challenges
