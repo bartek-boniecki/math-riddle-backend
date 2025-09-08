@@ -15,4 +15,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Oczekujemy, że OPENAI_API_KEY będzie podany w środowisku uruchomieniowym
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
