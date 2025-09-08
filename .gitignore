@@ -1,3 +1,4 @@
+@"
 # Python
 __pycache__/
 *.py[cod]
@@ -17,9 +18,10 @@ build/
 .DS_Store
 Thumbs.db
 
-# Secrets / env
+# Secrets / keys / env files
 .env
 .env.*
 *.env
 *.pem
 *.key
+"@ | Set-Content -Encoding UTF8 .gitignore
