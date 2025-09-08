@@ -1,0 +1,19 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-riddle-backend"
+version = "0.1.0"
+description = "Backend AI to generate Polish olympiad-style math challenges"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# we keep runtime deps in requirements.txt for deployment parity;
+# pyproject is mainly to enable editable installs reliably.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*","tests*"]
