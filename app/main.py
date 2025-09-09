@@ -3,12 +3,13 @@
 import os
 from typing import List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from dotenv import load_dotenv
 
 from .schemas import GenerateRequest, GenerateResponse
+from .rate_limit import SlidingWindowLimiter
 
 load_dotenv()
 
@@ -20,10 +21,43 @@ def _cors_origins_from_env() -> List[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
+# ---------- RATE LIMITER ----------
+RL_PER_MIN = int(os.getenv("RL_MAX_PER_MINUTE", "5"))
+RL_PER_DAY = int(os.getenv("RL_MAX_PER_DAY", "50"))
+_limiter = SlidingWindowLimiter(max_per_minute=RL_PER_MIN, max_per_day=RL_PER_DAY)
+
+
+def _client_ip(req: Request) -> str:
+    """
+    Wyciąga IP z nagłówków typowych dla proxy/CDN (Railway).
+    Upstreamy doklejają listę IP w X-Forwarded-For – bierzemy pierwsze.
+    """
+    xff = req.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    cf = req.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    real = req.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    return req.client.host if req.client else "unknown"
+
+
+def enforce_rate_limit(req: Request):
+    key = _client_ip(req)
+    ok, msg, retry = _limiter.allow(key)
+    if not ok:
+        # 429 Too Many Requests
+        headers = {"Retry-After": str(retry or 60)}
+        raise HTTPException(status_code=429, detail=msg, headers=headers)
+
+
+# ---------- APP ----------
 app = FastAPI(
     title="Olympiad Math Challenge Generator (PL)",
     description="Backend AI do generowania 5 trudnych zadań matematycznych po polsku.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -37,14 +71,15 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": os.getenv("LLM_MODEL", "gpt-4o-mini")}
+    return {
+        "status": "ok",
+        "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        "limits": {"per_minute": RL_PER_MIN, "per_day": RL_PER_DAY},
+    }
 
 
 @app.get("/meta")
 def meta():
-    """
-    Zwraca polskie listy do pól formularza. Backend akceptuje również dawne angielskie aliasy.
-    """
     from .schemas import BRANCH_PL, LEVEL_PL, SCENARIO_PL
 
     return {
@@ -60,24 +95,30 @@ def meta():
     }
 
 
+# ---------- GENERATE ----------
 @app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest):
+def generate(req: GenerateRequest, request: Request):
+    enforce_rate_limit(request)
     from .generator import generate_batch
 
     try:
         challenges = generate_batch(req)
         return GenerateResponse(count=len(challenges), challenges=challenges)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/generate", response_model=GenerateResponse)
 def generate_get(
+    request: Request,
     branch: str = Query(..., description="Dziedzina (PL; patrz /meta)"),
     school_level: str = Query(..., description="Poziom szkoły (PL; patrz /meta)"),
     scenario: str = Query(..., description="Scenariusz (PL; patrz /meta)"),
     seed: int | None = Query(None, description="Opcjonalne ziarno losowości"),
 ):
+    enforce_rate_limit(request)
     from .schemas import GenerateRequest as GR
     from .generator import generate_batch
 
@@ -85,16 +126,15 @@ def generate_get(
         req = GR(branch=branch, school_level=school_level, scenario=scenario, seed=seed)
         challenges = generate_batch(req)
         return GenerateResponse(count=len(challenges), challenges=challenges)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------- VIEWER (lekka strona wyników) ----------
 @app.get("/viewer", response_class=HTMLResponse)
 def viewer():
-    """
-    Prosta strona HTML renderowana po stronie backendu, która pobiera wyniki z /generate
-    i wyświetla 5 zadań. Używana przez front (np. Carrd/Wix) jako cel formularza (GET).
-    """
     return """
 <!doctype html>
 <html lang="pl">
@@ -160,7 +200,6 @@ def viewer():
       '<div class="actions">'+
         '<button class="btn" onclick="(function(){ const q=new URLSearchParams(location.search); q.set(\\'seed\\', String(Math.floor(Math.random()*1e9))); location.search=q.toString(); })()">🔄 Wygeneruj ponownie</button>'+
         '<button class="btn" onclick="(function(){ const txt=JSON.stringify(state.data||{},null,2); navigator.clipboard.writeText(txt); alert(\\'Skopiowano JSON.\\'); })()">📋 Kopiuj JSON</button>'+
-        '<button class="btn" onclick="(function(){ const blob=new Blob([JSON.stringify(state.data||{},null,2)],{type:\\'application/json;charset=utf-8\\'}); const url=URL.createObjectURL(blob); const a=document.createElement(\\'a\\'); a.href=url; a.download=\\'zadania.json\\'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); })()">💾 Pobierz JSON</button>'+
       '</div>'+
       '<div class="meta">'+meta+'</div>'+
       (items.length ? '<div class="grid">'+cards+'</div>' : '<div>Brak zadań w odpowiedzi.</div>');
