@@ -1,5 +1,83 @@
-from fastapi.responses import HTMLResponse
+# app/main.py
+from typing import Optional
 
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+
+# Uwaga: nie importujemy nic z .schemas na poziomie modułu,
+# aby uniknąć twardych zależności przy starcie.
+# Importy z .schemas/.generator robimy leniwie w handlerach.
+
+app = FastAPI(title="Math Riddle Backend", version="1.0.0")
+
+# CORS — Carrd/Teleport będą mogły wołać backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # ewentualnie zawęź do swojej domeny
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Prosty root z podpowiedzią ---
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {
+        "message": "POST /generate (JSON) lub GET /generate (query) do generowania 5 zadań. Sprawdź /meta po listy i przykłady.",
+        "docs": "/docs",
+    }
+
+# --- Meta: listy do UI (import wewnątrz, żeby nie blokować startu przy ewentualnej refaktorze schemas.py) ---
+@app.get("/meta", response_class=JSONResponse)
+def meta():
+    try:
+        from .schemas import (
+            ALLOWED_BRANCHES_PL,
+            ALLOWED_LEVELS_PL,
+            ALLOWED_SCENARIOS_PL,
+            EXAMPLE_PARAMS_PL,
+        )
+        return {
+            "branches": ALLOWED_BRANCHES_PL,
+            "levels": ALLOWED_LEVELS_PL,
+            "scenarios": ALLOWED_SCENARIOS_PL,
+            "example": EXAMPLE_PARAMS_PL,
+        }
+    except Exception as e:
+        # Nie blokuj serwera, daj minimalną odpowiedź
+        return {
+            "branches": [],
+            "levels": [],
+            "scenarios": [],
+            "example": {},
+            "warning": f"Meta unavailable: {type(e).__name__}",
+        }
+
+# --- Generate (GET) — zgodny z Twoim UI (branch, school_level, scenario, seed) ---
+@app.get("/generate", response_class=JSONResponse)
+def generate(
+    branch: str = Query(..., description="Dział"),
+    school_level: str = Query(..., description="Poziom szkoły"),
+    scenario: str = Query(..., description="Kontekst/scenariusz"),
+    seed: Optional[int] = Query(None, description="Opcjonalne ziarno losowości"),
+):
+    # Leniwe importy — bezpieczniejsze przy starcie
+    from .schemas import GenerateRequest
+    from .generator import generate_batch
+
+    req = GenerateRequest(
+        branch=branch,
+        school_level=school_level,
+        scenario=scenario,
+        seed=seed,
+        n=5,  # wymuś 5 zadań
+    )
+    out = generate_batch(req)
+    # generate_batch zwykle zwraca pydantic model albo dict — JSONResponse sobie poradzi
+    return out
+
+# --- /viewer: prosty HTML renderujący wyniki i wysyłający wysokość (postMessage) ---
 @app.get("/viewer", response_class=HTMLResponse)
 def viewer():
     return """
@@ -42,11 +120,7 @@ def viewer():
 
   function postHeight() {
     try {
-      const h = Math.max(
-        document.body.scrollHeight,
-        document.documentElement.scrollHeight
-      );
-      // wyślij do rodzica (Carrd)
+      const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
       parent.postMessage({ type: 'viewerHeight', h: h }, '*');
     } catch (e) {}
   }
@@ -90,7 +164,7 @@ def viewer():
       '<div class="meta">'+meta+'</div>'+
       (items.length ? '<div class="grid">'+cards+'</div>' : '<div>Brak zadań w odpowiedzi.</div>');
 
-    postHeight();  // po renderze
+    postHeight();
   }
 
   async function fetchData() {
@@ -111,7 +185,6 @@ def viewer():
     }
   }
 
-  // wysyłaj wysokość „na wszelki wypadek” też cyklicznie i po resize
   window.addEventListener('load', postHeight);
   window.addEventListener('resize', postHeight);
   setInterval(postHeight, 800);
@@ -122,3 +195,8 @@ def viewer():
 </body>
 </html>
     """
+
+# Lokalny start (opcjonalnie)
+if __name__ == "__main__":
+    import uvicorn, os
+    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
