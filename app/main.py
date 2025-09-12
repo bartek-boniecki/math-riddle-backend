@@ -1,138 +1,5 @@
-# app/main.py
+from fastapi.responses import HTMLResponse
 
-import os
-from typing import List
-
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
-from dotenv import load_dotenv
-
-from .schemas import GenerateRequest, GenerateResponse
-from .rate_limit import SlidingWindowLimiter
-
-load_dotenv()
-
-
-def _cors_origins_from_env() -> List[str]:
-    raw = (os.getenv("CORS_ORIGINS") or "*").strip()
-    if raw in ("", "*"):
-        return ["*"]
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-# ---------- RATE LIMITER ----------
-RL_PER_MIN = int(os.getenv("RL_MAX_PER_MINUTE", "5"))
-RL_PER_DAY = int(os.getenv("RL_MAX_PER_DAY", "50"))
-_limiter = SlidingWindowLimiter(max_per_minute=RL_PER_MIN, max_per_day=RL_PER_DAY)
-
-
-def _client_ip(req: Request) -> str:
-    """
-    Wyciąga IP z nagłówków typowych dla proxy/CDN (Railway).
-    Upstreamy doklejają listę IP w X-Forwarded-For – bierzemy pierwsze.
-    """
-    xff = req.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    cf = req.headers.get("cf-connecting-ip")
-    if cf:
-        return cf.strip()
-    real = req.headers.get("x-real-ip")
-    if real:
-        return real.strip()
-    return req.client.host if req.client else "unknown"
-
-
-def enforce_rate_limit(req: Request):
-    key = _client_ip(req)
-    ok, msg, retry = _limiter.allow(key)
-    if not ok:
-        # 429 Too Many Requests
-        headers = {"Retry-After": str(retry or 60)}
-        raise HTTPException(status_code=429, detail=msg, headers=headers)
-
-
-# ---------- APP ----------
-app = FastAPI(
-    title="Olympiad Math Challenge Generator (PL)",
-    description="Backend AI do generowania 5 trudnych zadań matematycznych po polsku.",
-    version="1.3.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins_from_env(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
-        "limits": {"per_minute": RL_PER_MIN, "per_day": RL_PER_DAY},
-    }
-
-
-@app.get("/meta")
-def meta():
-    from .schemas import BRANCH_PL, LEVEL_PL, SCENARIO_PL
-
-    return {
-        "branches": list(BRANCH_PL.values()),
-        "levels": list(LEVEL_PL.values()),
-        "scenarios": list(SCENARIO_PL.values()),
-        "example_payload": {
-            "branch": "Kombinatoryka",
-            "school_level": "liceum/technikum (klasy 9–12)",
-            "scenario": "sport",
-            "seed": 42,
-        },
-    }
-
-
-# ---------- GENERATE ----------
-@app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest, request: Request):
-    enforce_rate_limit(request)
-    from .generator import generate_batch
-
-    try:
-        challenges = generate_batch(req)
-        return GenerateResponse(count=len(challenges), challenges=challenges)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/generate", response_model=GenerateResponse)
-def generate_get(
-    request: Request,
-    branch: str = Query(..., description="Dziedzina (PL; patrz /meta)"),
-    school_level: str = Query(..., description="Poziom szkoły (PL; patrz /meta)"),
-    scenario: str = Query(..., description="Scenariusz (PL; patrz /meta)"),
-    seed: int | None = Query(None, description="Opcjonalne ziarno losowości"),
-):
-    enforce_rate_limit(request)
-    from .schemas import GenerateRequest as GR
-    from .generator import generate_batch
-
-    try:
-        req = GR(branch=branch, school_level=school_level, scenario=scenario, seed=seed)
-        challenges = generate_batch(req)
-        return GenerateResponse(count=len(challenges), challenges=challenges)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------- VIEWER (lekka strona wyników) ----------
 @app.get("/viewer", response_class=HTMLResponse)
 def viewer():
     return """
@@ -173,9 +40,28 @@ def viewer():
 
   const esc = s => String(s).replace(/[&<>\"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 
+  function postHeight() {
+    try {
+      const h = Math.max(
+        document.body.scrollHeight,
+        document.documentElement.scrollHeight
+      );
+      // wyślij do rodzica (Carrd)
+      parent.postMessage({ type: 'viewerHeight', h: h }, '*');
+    } catch (e) {}
+  }
+
   function render() {
-    if (state.loading) { root.innerHTML = '<div class="loading">⏳ Generuję zestaw 5 zadań…</div>'; return; }
-    if (state.error) { root.innerHTML = '<div class="error">Błąd: '+esc(state.error)+'</div>'; return; }
+    if (state.loading) {
+      root.innerHTML = '<div class="loading">⏳ Generuję zestaw 5 zadań…</div>';
+      postHeight();
+      return;
+    }
+    if (state.error) {
+      root.innerHTML = '<div class="error">Błąd: '+esc(state.error)+'</div>';
+      postHeight();
+      return;
+    }
     const items = (state.data && state.data.challenges) || [];
     const meta =
       'Parametry: <b>'+esc(params.branch)+'</b> · '+
@@ -203,6 +89,8 @@ def viewer():
       '</div>'+
       '<div class="meta">'+meta+'</div>'+
       (items.length ? '<div class="grid">'+cards+'</div>' : '<div>Brak zadań w odpowiedzi.</div>');
+
+    postHeight();  // po renderze
   }
 
   async function fetchData() {
@@ -223,14 +111,14 @@ def viewer():
     }
   }
 
+  // wysyłaj wysokość „na wszelki wypadek” też cyklicznie i po resize
+  window.addEventListener('load', postHeight);
+  window.addEventListener('resize', postHeight);
+  setInterval(postHeight, 800);
+
   render(); fetchData();
 })();
 </script>
 </body>
 </html>
     """
-
-
-@app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse(url="/docs", status_code=302)
