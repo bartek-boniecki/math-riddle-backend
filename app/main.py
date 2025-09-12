@@ -1,83 +1,168 @@
 # app/main.py
-from typing import Optional
+import os
+from typing import List, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 
-# Uwaga: nie importujemy nic z .schemas na poziomie modułu,
-# aby uniknąć twardych zależności przy starcie.
-# Importy z .schemas/.generator robimy leniwie w handlerach.
+# --- opcjonalnie: limiter (działa, jeśli masz app/rate_limit.py) ---
+try:
+    from .rate_limit import SlidingWindowLimiter  # type: ignore
+    RL_PER_MIN = int(os.getenv("RL_MAX_PER_MINUTE", "5"))
+    RL_PER_DAY = int(os.getenv("RL_MAX_PER_DAY", "50"))
+    _limiter = SlidingWindowLimiter(max_per_minute=RL_PER_MIN, max_per_day=RL_PER_DAY)
 
-app = FastAPI(title="Math Riddle Backend", version="1.0.0")
+    def _client_ip(req: Request) -> str:
+        xff = req.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
+        cf = req.headers.get("cf-connecting-ip")
+        if cf:
+            return cf.strip()
+        real = req.headers.get("x-real-ip")
+        if real:
+            return real.strip()
+        return req.client.host if req.client else "unknown"
 
-# CORS — Carrd/Teleport będą mogły wołać backend
+    def enforce_rate_limit(req: Request):
+        ok, msg, retry = _limiter.allow(_client_ip(req))
+        if not ok:
+            headers = {"Retry-After": str(retry or 60)}
+            raise HTTPException(status_code=429, detail=msg, headers=headers)
+
+except Exception:
+    _limiter = None
+
+    def enforce_rate_limit(req: Request):
+        return  # limiter nieaktywny
+
+
+# ------------------- APP -------------------
+app = FastAPI(
+    title="Olympiad Math Challenge Generator (PL)",
+    description="Backend AI do generowania 5 trudnych zadań matematycznych po polsku.",
+    version="1.4.0",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # ewentualnie zawęź do swojej domeny
+    allow_origins=["*"],  # ew. zawęź do swojej domeny
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Prosty root z podpowiedzią ---
-@app.get("/", response_class=JSONResponse)
+
+# ------------------- ROOT & HEALTH -------------------
+@app.get("/", include_in_schema=False)
 def root():
+    return RedirectResponse(url="/docs", status_code=302)
+
+
+@app.get("/health")
+def health():
     return {
-        "message": "POST /generate (JSON) lub GET /generate (query) do generowania 5 zadań. Sprawdź /meta po listy i przykłady.",
-        "docs": "/docs",
+        "status": "ok",
+        "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        "limits": {
+            "per_minute": int(os.getenv("RL_MAX_PER_MINUTE", "0") or 0),
+            "per_day": int(os.getenv("RL_MAX_PER_DAY", "0") or 0),
+        },
     }
 
-# --- Meta: listy do UI (import wewnątrz, żeby nie blokować startu przy ewentualnej refaktorze schemas.py) ---
+
+# ------------------- META -------------------
 @app.get("/meta", response_class=JSONResponse)
 def meta():
     try:
-        from .schemas import (
-            ALLOWED_BRANCHES_PL,
-            ALLOWED_LEVELS_PL,
-            ALLOWED_SCENARIOS_PL,
-            EXAMPLE_PARAMS_PL,
-        )
+        from .schemas import BRANCH_PL, LEVEL_PL, SCENARIO_PL
         return {
-            "branches": ALLOWED_BRANCHES_PL,
-            "levels": ALLOWED_LEVELS_PL,
-            "scenarios": ALLOWED_SCENARIOS_PL,
-            "example": EXAMPLE_PARAMS_PL,
+            "branches": list(BRANCH_PL.values()),
+            "levels": list(LEVEL_PL.values()),
+            "scenarios": list(SCENARIO_PL.values()),
+            "example": {
+                "branch": "Kombinatoryka",
+                "school_level": "liceum/technikum (klasy 9–12)",
+                "scenario": "sport",
+                "seed": 42,
+            },
         }
-    except Exception as e:
-        # Nie blokuj serwera, daj minimalną odpowiedź
+    except Exception:
+        # fallback – serwer nadal działa
         return {
             "branches": [],
             "levels": [],
             "scenarios": [],
             "example": {},
-            "warning": f"Meta unavailable: {type(e).__name__}",
         }
 
-# --- Generate (GET) — zgodny z Twoim UI (branch, school_level, scenario, seed) ---
+
+# ------------------- GENERATE (POST) -------------------
+@app.post("/generate", response_class=JSONResponse)
+def generate_post(req: Request, body: dict):
+    enforce_rate_limit(req)
+    try:
+        # Lazy imports -> bezpieczniej przy starcie
+        from .schemas import GenerateRequest, GenerateResponse
+        from .generator import generate_batch
+
+        parsed = GenerateRequest(**body)
+        challenges = generate_batch(parsed)
+        if not challenges:
+            raise HTTPException(
+                status_code=502,
+                detail="Generator zwrócił pusty wynik (LLM). Spróbuj ponownie lub zmień parametry.",
+            )
+        resp = GenerateResponse(count=len(challenges), challenges=challenges)
+        return JSONResponse(content=resp.model_dump())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------- GENERATE (GET) -------------------
 @app.get("/generate", response_class=JSONResponse)
-def generate(
-    branch: str = Query(..., description="Dział"),
-    school_level: str = Query(..., description="Poziom szkoły"),
-    scenario: str = Query(..., description="Kontekst/scenariusz"),
+def generate_get(
+    req: Request,
+    branch: str = Query(..., description="Dział (PL; patrz /meta)"),
+    school_level: str = Query(..., description="Poziom szkoły (PL; patrz /meta)"),
+    scenario: str = Query(..., description="Scenariusz (PL; patrz /meta)"),
     seed: Optional[int] = Query(None, description="Opcjonalne ziarno losowości"),
+    n: Optional[int] = Query(5, description="Liczba zadań (domyślnie 5)"),
 ):
-    # Leniwe importy — bezpieczniejsze przy starcie
-    from .schemas import GenerateRequest
-    from .generator import generate_batch
+    enforce_rate_limit(req)
+    try:
+        from .schemas import GenerateRequest, GenerateResponse
+        from .generator import generate_batch
 
-    req = GenerateRequest(
-        branch=branch,
-        school_level=school_level,
-        scenario=scenario,
-        seed=seed,
-        n=5,  # wymuś 5 zadań
-    )
-    out = generate_batch(req)
-    # generate_batch zwykle zwraca pydantic model albo dict — JSONResponse sobie poradzi
-    return out
+        parsed = GenerateRequest(
+            branch=branch,
+            school_level=school_level,
+            scenario=scenario,
+            seed=seed,
+            n=n or 5,
+        )
+        challenges = generate_batch(parsed)
 
-# --- /viewer: prosty HTML renderujący wyniki i wysyłający wysokość (postMessage) ---
+        if not challenges:
+            # świadomie sygnalizujemy błąd upstream, zamiast 200 z pustką
+            raise HTTPException(
+                status_code=502,
+                detail="Generator zwrócił pusty wynik (LLM). Spróbuj ponownie lub zmień parametry.",
+            )
+
+        resp = GenerateResponse(count=len(challenges), challenges=challenges)
+        return JSONResponse(content=resp.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------- VIEWER (SSR HTML) -------------------
 @app.get("/viewer", response_class=HTMLResponse)
 def viewer():
     return """
@@ -127,21 +212,36 @@ def viewer():
 
   function render() {
     if (state.loading) {
-      root.innerHTML = '<div class="loading">⏳ Generuję zestaw 5 zadań…</div>';
-      postHeight();
-      return;
+      root.innerHTML = '<div class="loading">⏳ Generuję zestaw 5 zadań…</div>'; postHeight(); return;
     }
     if (state.error) {
-      root.innerHTML = '<div class="error">Błąd: '+esc(state.error)+'</div>';
-      postHeight();
-      return;
+      root.innerHTML = '<div class="error">Błąd: '+esc(state.error)+'</div>'; postHeight(); return;
     }
-    const items = (state.data && state.data.challenges) || [];
+
+    // 👇 NEW: tolerancja na różne kształty odpowiedzi
+    let items = [];
+    if (Array.isArray(state.data)) {
+      items = state.data;
+    } else if (state.data && Array.isArray(state.data.challenges)) {
+      items = state.data.challenges;
+    }
+
     const meta =
       'Parametry: <b>'+esc(params.branch)+'</b> · '+
       '<b>'+esc(params.school_level)+'</b> · '+
       '<b>'+esc(params.scenario)+'</b>' +
       (params.seed ? ' · seed=<b>'+esc(params.seed)+'</b>' : '');
+
+    if (!items.length) {
+      root.innerHTML =
+        '<div class="actions">'+
+          '<button class="btn" onclick="(function(){ const q=new URLSearchParams(location.search); q.set(\\'seed\\', String(Math.floor(Math.random()*1e9))); location.search=q.toString(); })()">🔄 Wygeneruj ponownie</button>'+
+        '</div>'+
+        '<div class="meta">'+meta+'</div>'+
+        '<div>Brak zadań w odpowiedzi.</div>';
+      postHeight();
+      return;
+    }
 
     const cards = items.map(c =>
       '<div class="card">'+
@@ -162,7 +262,7 @@ def viewer():
         '<button class="btn" onclick="(function(){ const txt=JSON.stringify(state.data||{},null,2); navigator.clipboard.writeText(txt); alert(\\'Skopiowano JSON.\\'); })()">📋 Kopiuj JSON</button>'+
       '</div>'+
       '<div class="meta">'+meta+'</div>'+
-      (items.length ? '<div class="grid">'+cards+'</div>' : '<div>Brak zadań w odpowiedzi.</div>');
+      '<div class="grid">'+cards+'</div>';
 
     postHeight();
   }
@@ -177,7 +277,11 @@ def viewer():
     state.loading = true; state.error = null; render();
     try {
       const res = await fetch(url.toString(), { method: 'GET' });
-      if (!res.ok) throw new Error('Backend ' + res.status);
+      if (!res.ok) {
+        let detail = 'Backend ' + res.status;
+        try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch(e){}
+        throw new Error(detail);
+      }
       state.data = await res.json();
       state.loading = false; render();
     } catch (e) {
@@ -195,8 +299,3 @@ def viewer():
 </body>
 </html>
     """
-
-# Lokalny start (opcjonalnie)
-if __name__ == "__main__":
-    import uvicorn, os
-    uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
