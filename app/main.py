@@ -1,16 +1,17 @@
 # app/main.py
+
 import os
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 
-# --- opcjonalnie: limiter (działa, jeśli masz app/rate_limit.py) ---
+# --- Rate limiter (optional) ---
 try:
     from .rate_limit import SlidingWindowLimiter  # type: ignore
     RL_PER_MIN = int(os.getenv("RL_MAX_PER_MINUTE", "5"))
-    RL_PER_DAY = int(os.getenv("RL_MAX_PER_DAY", "50"))
+    RL_PER_DAY = int(os.getenv("RL_MAX_PER_DAY", "80"))
     _limiter = SlidingWindowLimiter(max_per_minute=RL_PER_MIN, max_per_day=RL_PER_DAY)
 
     def _client_ip(req: Request) -> str:
@@ -35,42 +36,40 @@ except Exception:
     _limiter = None
 
     def enforce_rate_limit(req: Request):
-        return  # limiter nieaktywny
-
+        return  # limiter disabled
 
 # ------------------- APP -------------------
 app = FastAPI(
-    title="Olympiad Math Challenge Generator (PL)",
-    description="Backend AI do generowania 5 trudnych zadań matematycznych po polsku.",
-    version="1.4.0",
+    title="Olympiad Math Challenge Generator (PL) – HF/Llama3.1-8B",
+    description="Backend AI (HuggingFace only) do generowania 5 trudnych zadań matematycznych po polsku.",
+    version="2.2.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ew. zawęź do swojej domeny
+    allow_origins=["*"],  # tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ------------------- ROOT & HEALTH -------------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs", status_code=302)
 
-
-@app.get("/health")
+@app.get("/health", response_class=JSONResponse)
 def health():
+    from .llm import current_model_id
     return {
         "status": "ok",
-        "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        "provider": "huggingface_hub",
+        "model": current_model_id(),
         "limits": {
             "per_minute": int(os.getenv("RL_MAX_PER_MINUTE", "0") or 0),
             "per_day": int(os.getenv("RL_MAX_PER_DAY", "0") or 0),
         },
     }
-
 
 # ------------------- META -------------------
 @app.get("/meta", response_class=JSONResponse)
@@ -79,36 +78,28 @@ def meta():
         from .schemas import BRANCH_PL, LEVEL_PL, SCENARIO_PL
         return {
             "branches": list(BRANCH_PL.values()),
-            "levels": list(LEVEL_PL.values()),
+            "levels": list(LEVEL_PL.values()),  # e.g., ["SP-1-5", "SP-6-8", "Liceum-Technikum"]
             "scenarios": list(SCENARIO_PL.values()),
             "example": {
                 "branch": "Kombinatoryka",
-                "school_level": "liceum/technikum (klasy 9–12)",
+                "school_level": "Liceum-Technikum",
                 "scenario": "sport",
                 "seed": 42,
             },
         }
     except Exception:
-        # fallback – serwer nadal działa
-        return {
-            "branches": [],
-            "levels": [],
-            "scenarios": [],
-            "example": {},
-        }
-
+        return {"branches": [], "levels": [], "scenarios": [], "example": {}}
 
 # ------------------- GENERATE (POST) -------------------
 @app.post("/generate", response_class=JSONResponse)
 def generate_post(req: Request, body: dict):
     enforce_rate_limit(req)
     try:
-        # Lazy imports -> bezpieczniej przy starcie
         from .schemas import GenerateRequest, GenerateResponse
         from .generator import generate_batch
 
         parsed = GenerateRequest(**body)
-        challenges = generate_batch(parsed)
+        challenges = generate_batch(parsed, n=5)  # always 5 per request
         if not challenges:
             raise HTTPException(
                 status_code=502,
@@ -121,16 +112,14 @@ def generate_post(req: Request, body: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ------------------- GENERATE (GET) -------------------
 @app.get("/generate", response_class=JSONResponse)
 def generate_get(
     req: Request,
     branch: str = Query(..., description="Dział (PL; patrz /meta)"),
-    school_level: str = Query(..., description="Poziom szkoły (PL; patrz /meta)"),
+    school_level: str = Query(..., description="Poziom szkoły (np. SP-1-5, SP-6-8, Liceum-Technikum)"),
     scenario: str = Query(..., description="Scenariusz (PL; patrz /meta)"),
     seed: Optional[int] = Query(None, description="Opcjonalne ziarno losowości"),
-    n: Optional[int] = Query(5, description="Liczba zadań (domyślnie 5)"),
 ):
     enforce_rate_limit(req)
     try:
@@ -142,12 +131,10 @@ def generate_get(
             school_level=school_level,
             scenario=scenario,
             seed=seed,
-            n=n or 5,
         )
-        challenges = generate_batch(parsed)
+        challenges = generate_batch(parsed, n=5)  # hard-enforced: 5 problems
 
         if not challenges:
-            # świadomie sygnalizujemy błąd upstream, zamiast 200 z pustką
             raise HTTPException(
                 status_code=502,
                 detail="Generator zwrócił pusty wynik (LLM). Spróbuj ponownie lub zmień parametry.",
@@ -160,7 +147,6 @@ def generate_get(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ------------------- VIEWER (SSR HTML) -------------------
 @app.get("/viewer", response_class=HTMLResponse)
@@ -218,7 +204,6 @@ def viewer():
       root.innerHTML = '<div class="error">Błąd: '+esc(state.error)+'</div>'; postHeight(); return;
     }
 
-    // 👇 NEW: tolerancja na różne kształty odpowiedzi
     let items = [];
     if (Array.isArray(state.data)) {
       items = state.data;
@@ -246,7 +231,7 @@ def viewer():
     const cards = items.map(c =>
       '<div class="card">'+
         '<div class="muted"><b>#'+esc(c.id)+'</b> · '+esc(c.branch)+' · '+esc(c.school_level)+' · '+esc(c.scenario)+'</div>'+
-        '<div class="muted">Typ: <i>'+esc(c.challenge_type)+'</i> · Narzędzie: <i>'+esc(c.tool)+'</i></div>'+
+        '<div class="muted">Typ: <i>'+esc(c.challenge_type)+'</i> · Narzędzie: <i>'+(c.tool ? esc(c.tool) : '—')+'</i></div>'+
         '<div class="label" style="margin-top:8px;">Treść zadania</div>'+
         '<div>'+esc(c.problem).replace(/\\n/g,"<br>")+'</div>'+
         '<div class="label">Szkic rozwiązania</div>'+
